@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it and the original XGBoost paper."
+title: "ExplainableXGB"
+authors:
+  - family-names: "Pikatza-Huerga"
+    given-names: "Amaia"
+  - family-names: "Gonzalez-Santocildes"
+    given-names: "Asier"
+license: "Apache-2.0"
+repository-code: "https://github.com/apikatza/explainable-xgb"
+version: "0.1.0"
+references:
+  - type: conference-paper
+    title: "XGBoost: A Scalable Tree Boosting System"
+    authors:
+      - family-names: "Chen"
+        given-names: "Tianqi"
+      - family-names: "Guestrin"
+        given-names: "Carlos"
+    conference:
+      name: "Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining"
+    year: 2016
+    doi: "10.1145/2939672.2939785"

@@ -76,6 +76,17 @@ including where this trade-off does and does not pay off.
 pytest tests/
 ```
 
+## Citation
+
+This package builds directly on XGBoost's native training primitives (`interaction_constraints`,
+staged boosting via `xgb_model` continuation) — if you use it, please cite XGBoost itself alongside this
+repository (see `CITATION.cff`):
+
+- Amaia Pikatza-Huerga and Asier Gonzalez-Santocildes. *ExplainableXGB*.
+  https://github.com/apikatza/explainable-xgb
+- Tianqi Chen and Carlos Guestrin. XGBoost: A Scalable Tree Boosting System. KDD 2016.
+  https://doi.org/10.1145/2939672.2939785
+
 ## Licence
 
 Apache License 2.0 — see `LICENSE`.
