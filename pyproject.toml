@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "explainablexgb"
+version = "0.1.0"
+description = "An inherently interpretable additive model built from XGBoost's own native staged-boosting and interaction-constraint primitives."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Amaia Pikatza-Huerga", email = "a.pikatza@deusto.es" },
+    { name = "Asier Gonzalez-Santocildes", email = "gonzalez.asier@deusto.es" },
+]
+dependencies = [
+    "numpy>=1.23",
+    "scipy>=1.9",
+    "xgboost>=2.0",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["explainablexgb*"]
