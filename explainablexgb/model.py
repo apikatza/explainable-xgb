@@ -265,6 +265,18 @@ class ExplainableXGB:
 
     Prediction and explanation are both computed from the resulting staged
     trees, so local explanations are the exact score decomposition.
+
+    When ``n_refine_rounds > 1``, this main-effect/interaction pair of stages
+    is repeated that many times, each iteration continuing (warm-starting)
+    from the previous iteration's booster rather than starting over, so later
+    main-effect rounds see the residual left after earlier interaction terms
+    and vice versa -- analogous to GAMI-Tree's multi-round refinement and to
+    EBM's cyclic backfitting, as opposed to a single main-then-interactions
+    pass. Interaction pairs are re-selected each iteration from the current
+    residual, so the same pair may be reinforced across iterations or a
+    different pair may emerge as the model changes; ``_selected_interactions``
+    accumulates the union of every pair ever selected, in first-selection
+    order.
     """
 
     def __init__(
@@ -278,6 +290,9 @@ class ExplainableXGB:
         shape_smoothing_strength: str = "moderate",
         lambda_complexity: float = 0.0,
         xgb_params: Optional[Mapping[str, Any]] = None,
+        n_refine_rounds: int = 1,
+        early_stopping_rounds: int = 10,
+        validation_fraction: float = 0.15,
     ) -> None:
         self.max_main_effects = max_main_effects
         self.max_interactions = max_interactions
@@ -287,6 +302,9 @@ class ExplainableXGB:
         self.shape_smoothing_strength = shape_smoothing_strength
         self.lambda_complexity = lambda_complexity
         self.xgb_params = dict(xgb_params or {})
+        self.n_refine_rounds = max(1, int(n_refine_rounds))
+        self.early_stopping_rounds = max(2, int(early_stopping_rounds))
+        self.validation_fraction = validation_fraction
 
         self.booster_: Any = None
         self.terms_: List[TreeTerm] = []
@@ -323,45 +341,153 @@ class ExplainableXGB:
         dtrain = DMatrix(matrix, label=y_array, feature_names=self.feature_names_)
 
         total_rounds = int(self.xgb_params.get("n_estimators", 120))
-        main_rounds = max(1, min(self.max_main_effects, total_rounds))
-        interaction_rounds = max(0, total_rounds - main_rounds)
         base_params = self._base_params()
 
-        main_params = dict(base_params)
-        main_params["max_depth"] = self.max_depth_main
-        self.booster_ = train(
-            main_params,
-            dtrain,
-            num_boost_round=main_rounds,
-            verbose_eval=False,
-        )
-        self._stage_plan = [("main", None, main_rounds)]
+        if self.n_refine_rounds <= 1:
+            # Single pass: main-effect stage once, then interactions once.
+            # Kept byte-for-byte equivalent to the pre-refinement behaviour
+            # (no internal validation split, no early stopping) so every
+            # number already reported for n_refine_rounds=1 stays reproducible.
+            main_rounds = max(1, min(self.max_main_effects, total_rounds))
+            interaction_rounds = max(0, total_rounds - main_rounds)
 
-        self._selected_interactions = self._select_interaction_pairs(y_array)
-        if self._selected_interactions and interaction_rounds:
-            rounds_left = interaction_rounds
-            for idx, pair in enumerate(self._selected_interactions):
-                stages_left = len(self._selected_interactions) - idx
-                rounds = max(1, math.ceil(rounds_left / stages_left))
-                rounds = min(rounds, rounds_left)
-                pair_params = dict(base_params)
-                pair_params["max_depth"] = self.max_depth_interaction
-                pair_params["interaction_constraints"] = [list(pair)]
-                self.booster_ = train(
-                    pair_params,
-                    dtrain,
-                    num_boost_round=rounds,
-                    xgb_model=self.booster_,
-                    verbose_eval=False,
-                )
-                self._stage_plan.append(("interaction", pair, rounds))
-                rounds_left -= rounds
-                if rounds_left <= 0:
-                    break
+            main_params = dict(base_params)
+            main_params["max_depth"] = self.max_depth_main
+            self.booster_ = train(
+                main_params,
+                dtrain,
+                num_boost_round=main_rounds,
+                verbose_eval=False,
+            )
+            self._stage_plan = [("main", None, main_rounds)]
+
+            self._selected_interactions = self._select_interaction_pairs(y_array)
+            if self._selected_interactions and interaction_rounds:
+                rounds_left = interaction_rounds
+                for idx, pair in enumerate(self._selected_interactions):
+                    stages_left = len(self._selected_interactions) - idx
+                    rounds = max(1, math.ceil(rounds_left / stages_left))
+                    rounds = min(rounds, rounds_left)
+                    pair_params = dict(base_params)
+                    pair_params["max_depth"] = self.max_depth_interaction
+                    pair_params["interaction_constraints"] = [list(pair)]
+                    self.booster_ = train(
+                        pair_params,
+                        dtrain,
+                        num_boost_round=rounds,
+                        xgb_model=self.booster_,
+                        verbose_eval=False,
+                    )
+                    self._stage_plan.append(("interaction", pair, rounds))
+                    rounds_left -= rounds
+                    if rounds_left <= 0:
+                        break
+        else:
+            self._fit_iterative_early_stopped(matrix, y_array, total_rounds, base_params)
 
         self.base_score_ = self._extract_base_score(self.booster_)
         self._build_terms_from_booster(matrix)
         return self
+
+    def _fit_iterative_early_stopped(
+        self,
+        matrix: np.ndarray,
+        y_array: np.ndarray,
+        total_rounds: int,
+        base_params: Dict[str, Any],
+    ) -> None:
+        """GAMI-Tree-style multi-round refinement with real, validation-based
+        early stopping per stage, instead of a fixed round schedule.
+
+        An internal holdout (``validation_fraction`` of the training rows,
+        never the outer cross-validation test fold) drives early stopping for
+        every stage. Each stage is capped at a share of the *remaining* total
+        round budget, trained with XGBoost's native ``early_stopping_rounds``,
+        then truncated to its own best iteration
+        (``booster[:booster.best_iteration + 1]``) before the next stage
+        continues from it -- verified to be numerically exact (bit-identical
+        to ``predict(..., iteration_range=(0, best_iteration + 1))`` on the
+        untruncated booster). Rounds a stage does not use are returned to the
+        remaining budget for later stages/iterations. An iteration that adds
+        zero rounds to both the main-effect and interaction stages means the
+        model has converged, and refinement stops early.
+        """
+        rng = np.random.default_rng(int(base_params.get("random_state", 2026)))
+        n_rows = matrix.shape[0]
+        perm = rng.permutation(n_rows)
+        n_valid = max(10, min(n_rows - 10, int(round(self.validation_fraction * n_rows))))
+        valid_idx, train_idx = perm[:n_valid], perm[n_valid:]
+        dtr = DMatrix(matrix[train_idx], label=y_array[train_idx], feature_names=self.feature_names_)
+        dva = DMatrix(matrix[valid_idx], label=y_array[valid_idx], feature_names=self.feature_names_)
+        evals = [(dva, "valid")]
+
+        self._stage_plan = []
+        self._selected_interactions = []
+        self.booster_ = None
+        seen_pairs: set = set()
+        total_used = 0
+
+        for _ in range(self.n_refine_rounds):
+            remaining = total_rounds - total_used
+            if remaining <= 0:
+                break
+
+            main_cap = max(1, min(self.max_main_effects, remaining))
+            main_params = dict(base_params)
+            main_params["max_depth"] = self.max_depth_main
+            booster = train(
+                main_params,
+                dtr,
+                num_boost_round=main_cap,
+                xgb_model=self.booster_,
+                evals=evals,
+                early_stopping_rounds=min(self.early_stopping_rounds, main_cap),
+                verbose_eval=False,
+            )
+            booster = booster[: booster.best_iteration + 1]
+            main_used = booster.num_boosted_rounds() - total_used
+            self.booster_ = booster
+            if main_used > 0:
+                self._stage_plan.append(("main", None, main_used))
+            total_used += main_used
+
+            remaining = total_rounds - total_used
+            round_pairs = self._select_interaction_pairs(y_array) if remaining > 0 else []
+            interaction_used_total = 0
+            if round_pairs:
+                rounds_left_cap = remaining
+                for pidx, pair in enumerate(round_pairs):
+                    if rounds_left_cap <= 0:
+                        break
+                    stages_left = len(round_pairs) - pidx
+                    pair_cap = max(1, math.ceil(rounds_left_cap / stages_left))
+                    pair_cap = min(pair_cap, rounds_left_cap)
+                    pair_params = dict(base_params)
+                    pair_params["max_depth"] = self.max_depth_interaction
+                    pair_params["interaction_constraints"] = [list(pair)]
+                    booster = train(
+                        pair_params,
+                        dtr,
+                        num_boost_round=pair_cap,
+                        xgb_model=self.booster_,
+                        evals=evals,
+                        early_stopping_rounds=min(self.early_stopping_rounds, pair_cap),
+                        verbose_eval=False,
+                    )
+                    booster = booster[: booster.best_iteration + 1]
+                    used = booster.num_boosted_rounds() - total_used
+                    self.booster_ = booster
+                    if used > 0:
+                        self._stage_plan.append(("interaction", pair, used))
+                        if pair not in seen_pairs:
+                            seen_pairs.add(pair)
+                            self._selected_interactions.append(pair)
+                    total_used += used
+                    interaction_used_total += used
+                    rounds_left_cap -= used
+
+            if main_used == 0 and interaction_used_total == 0:
+                break
 
     def predict_proba(self, X: Any) -> np.ndarray:
         if self._is_regression_objective():
@@ -1010,6 +1136,19 @@ class ExplainableXGB:
             )
 
     def _rank_features_for_interactions(self, y: np.ndarray) -> List[str]:
+        """Rank features for interaction-candidate generation.
+
+        Features that appeared as a split in the main-effect-stage trees are
+        ranked first, by their main-effect importance. A feature whose effect
+        is purely interactive -- no marginal/main effect at all -- never gets
+        a main-effect split and would otherwise be permanently invisible to
+        the candidate pool (audit finding A2). To close that gap, any
+        remaining unselected features are appended, ranked by their raw
+        correlation with the target, up to ``max_main_effects`` features
+        total, so a pure-interaction feature still has a chance to be
+        considered once its correlate-with-y signal (even if weak or
+        nonlinear) is nonzero.
+        """
         term_scores: Dict[str, float] = {}
         if self.booster_ is not None:
             for tree in self.booster_.get_dump(dump_format="json"):
@@ -1020,29 +1159,37 @@ class ExplainableXGB:
                         term_scores.get(features[0], 0.0)
                         + self._mean_abs_leaf(parsed)
                     )
-        if len(term_scores) >= 2:
-            return [
-                feature
-                for feature, _ in sorted(
-                    term_scores.items(), key=lambda item: item[1], reverse=True
-                )
-            ]
+        main_effect_ranked = [
+            feature
+            for feature, _ in sorted(
+                term_scores.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
 
         assert self._training_matrix is not None
         y_centered = y - np.mean(y)
-        scores = []
+        correlation_scores = []
         for idx, feature in enumerate(self.feature_names_):
+            if feature in term_scores:
+                continue
             col = self._training_matrix[:, idx]
             col_centered = col - np.nanmean(col)
             denom = np.linalg.norm(col_centered) * np.linalg.norm(y_centered)
             score = 0.0
             if denom != 0:
                 score = abs(float(np.dot(col_centered, y_centered) / denom))
-            scores.append((feature, score))
-        return [
+            correlation_scores.append((feature, score))
+        correlation_ranked = [
             feature
-            for feature, _ in sorted(scores, key=lambda item: item[1], reverse=True)
+            for feature, _ in sorted(
+                correlation_scores, key=lambda item: item[1], reverse=True
+            )
         ]
+
+        if len(main_effect_ranked) >= 2:
+            remaining_slots = max(0, self.max_main_effects - len(main_effect_ranked))
+            return main_effect_ranked + correlation_ranked[:remaining_slots]
+        return main_effect_ranked + correlation_ranked
 
     def _build_terms_from_booster(self, matrix: np.ndarray) -> None:
         raw_trees = [
@@ -1283,7 +1430,8 @@ class ExplainableXGBMulticlass:
     This class does not change the core staged-boosting algorithm, the
     interaction-selection heuristic, or the complexity control of
     ``ExplainableXGB`` in any way -- it is purely an OvR composition layer
-    needed to be able to evaluate the estimator on multiclass datasets.
+    needed to be able to evaluate the estimator on multiclass datasets such
+    as Covertype at all.
     """
 
     def __init__(
@@ -1298,6 +1446,7 @@ class ExplainableXGBMulticlass:
         shape_smoothing_strength: str = "moderate",
         lambda_complexity: float = 0.0,
         xgb_params: Optional[Mapping[str, Any]] = None,
+        n_refine_rounds: int = 1,
     ) -> None:
         # ``n_classes`` is accepted for API convenience / logging but the
         # authoritative source of truth is always ``np.unique(y)`` at fit
@@ -1312,6 +1461,7 @@ class ExplainableXGBMulticlass:
             shape_smoothing_strength=shape_smoothing_strength,
             lambda_complexity=lambda_complexity,
             xgb_params=xgb_params,
+            n_refine_rounds=n_refine_rounds,
         )
         self.classifiers_: List[ExplainableXGB] = []
         self.classes_: np.ndarray = np.array([])

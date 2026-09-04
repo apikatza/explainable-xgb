@@ -37,10 +37,11 @@ Requires `numpy`, `scipy` and `xgboost` (>=2.0).
 from explainablexgb import ExplainableXGB
 
 model = ExplainableXGB(
-    max_main_effects=30,
+    max_main_effects=100,
     max_interactions=10,
+    max_depth_interaction=3,
     lambda_complexity=0.0,       # >0 trades interaction count for a real gain threshold
-    xgb_params={"n_estimators": 120, "learning_rate": 0.05, "objective": "binary:logistic"},
+    xgb_params={"n_estimators": 400, "learning_rate": 0.05, "objective": "binary:logistic"},
 )
 model.fit(X_train, y_train, feature_names=feature_names)
 
@@ -49,12 +50,18 @@ model.explain_global()          # main effects + interactions, ranked by importa
 model.explain_local(X_test[:1]) # exact per-row score decomposition
 ```
 
+The configuration above (`n_estimators=400`, `max_main_effects=100`, `max_depth_interaction=3`) is the
+capacity-matched setting the accompanying paper evaluates as its main protocol; a smaller, faster
+configuration (e.g. `n_estimators=120`, `max_main_effects=30`, `max_depth_interaction=2`) still trains a
+valid model with the same exact-decomposition guarantee, just at lower capacity — see "Why this exists"
+below for what that trade-off costs.
+
 Multiclass tasks (one-vs-rest, softmax over per-class raw margins):
 
 ```python
 from explainablexgb import ExplainableXGBMulticlass
 
-model = ExplainableXGBMulticlass(max_main_effects=20, max_interactions=8)
+model = ExplainableXGBMulticlass(max_main_effects=65, max_interactions=8, max_depth_interaction=3)
 model.fit(X_train, y_train, feature_names=feature_names)
 model.predict_proba(X_test)
 ```
@@ -62,13 +69,18 @@ model.predict_proba(X_test)
 ## Why this exists
 
 Gradient-boosted tree ensembles are strong predictors but not directly interpretable. GA²M-style
-additive-plus-interaction models (e.g. Explainable Boosting Machines) trade some flexibility for an
-exactly decomposable structure. `ExplainableXGB` asks whether that same structure can be produced with
-no custom training algorithm at all — using only XGBoost's own native `interaction_constraints` and
-staged boosting. It generally does not close the predictive gap to a dedicated GA²M implementation; its
-value is a training-stack-native construction with an empirically verified exact-decomposition guarantee
-and a real, quantified complexity/accuracy control. See the accompanying paper for the full evaluation,
-including where this trade-off does and does not pay off.
+additive-plus-interaction models (e.g. Explainable Boosting Machines, EBM) trade some flexibility for an
+exactly decomposable structure, fit with a cyclic, multi-pass, term-by-term training procedure.
+`ExplainableXGB` asks whether that same structure can be produced with no custom training algorithm at
+all — using only XGBoost's own native `interaction_constraints` and staged boosting, and whether a
+larger single-pass training budget can substitute for EBM's repeated revisiting of every term. At a
+sufficiently large budget, it can, on several benchmarks: `ExplainableXGB` significantly exceeds EBM on
+some datasets and metrics, ties it on others, and remains behind on others — a real, if partial and
+metric-dependent, predictive improvement, not a uniform win. That gain is not free: it costs several
+times more training and inference time than an unconstrained XGBoost model, and on at least one dataset
+it trades away cross-validation explanation stability that a smaller-capacity configuration has. See the
+accompanying paper for the full evaluation, including exactly where this trade-off does and does not pay
+off.
 
 ## Testing
 
